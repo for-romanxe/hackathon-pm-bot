@@ -1,0 +1,238 @@
+/**
+ * The long-running worker — Inky's "runs on its own" trigger layer.
+ *
+ * One in-process scheduler (croner) per configured job fires the standup on its
+ * cron, each with its own window — so you can run, e.g., a daily standup AND a
+ * weekly one from a single process. Each tick is wrapped so a failed run (GitHub
+ * hiccup, LLM error, Discord 5xx) is logged and the worker keeps going — a daemon
+ * must never die on one bad day. croner's `protect` guards against overlap if a
+ * run outlasts its interval.
+ *
+ * This is a thin adapter over buildStandup() + the Discord delivery, kept
+ * host-agnostic: deploy it to any always-on host (Render/Railway/Fly/a box). The
+ * scheduler and the cycle body are injectable so the wiring is unit-tested
+ * without real timers or network.
+ */
+import { Cron } from 'croner';
+import type { Config, ScheduleJob, Secrets } from './config.js';
+import { resolveWebhookUrl } from './config.js';
+import type { ConfigWatch } from './config-source.js';
+import { buildStandup } from './standup.js';
+import { postStandupToDiscord } from './discord.js';
+import { configFeatureFlags, noopTracker, type Tracker } from './telemetry.js';
+
+/** Daily anonymous liveness ping — distinguishes a live deployment from a
+ *  one-time trial. Only scheduled when telemetry is opted-in and active. */
+const HEARTBEAT_CRON = '0 0 * * *';
+
+/** The slice of a scheduled job the worker needs — satisfied by croner's Cron. */
+export interface ScheduledJob {
+  nextRun(): Date | null;
+  stop(): void;
+}
+
+/**
+ * Creates a scheduled job. Defaults to croner; tests inject a fake that fires
+ * the tick synchronously. The job always uses overlap protection (a tick is
+ * skipped while a previous run is still in flight).
+ */
+export type SchedulerFactory = (
+  pattern: string,
+  options: { timezone: string },
+  onTick: () => void | Promise<void>,
+) => ScheduledJob;
+
+const cronScheduler: SchedulerFactory = (pattern, options, onTick) =>
+  new Cron(pattern, { timezone: options.timezone, protect: true }, onTick);
+
+export interface WorkerOptions {
+  /** Progress sink (defaults to stderr). */
+  log?: (msg: string) => void;
+  /** Run every configured job once immediately and resolve, without scheduling. */
+  once?: boolean;
+  /** Build each standup but print it instead of posting (no webhook required). */
+  dryRun?: boolean;
+  /** Injectable scheduler (defaults to croner). */
+  scheduler?: SchedulerFactory;
+  /** Injectable per-job cycle body (defaults to the real build + deliver). */
+  runJob?: (job: ScheduleJob) => Promise<void>;
+  /** Anonymous usage telemetry (opt-in). Defaults to the inert noop tracker. */
+  telemetry?: Tracker;
+  /**
+   * Subscribe to live config changes (from a {@link ConfigSource}). When given,
+   * the worker re-reads config without a restart: it swaps the config used for
+   * each run and, if the schedule changed, tears down and rebuilds the cron jobs.
+   * Omit it (the default) and the worker uses the boot config forever, exactly as
+   * before. Ignored in `--once` mode (a single cycle never reschedules).
+   */
+  watch?: ConfigWatch;
+}
+
+export interface WorkerHandle {
+  /** Stop scheduling further runs (all jobs). */
+  stop: () => void;
+  /** The soonest next run across all jobs (null in --once mode). */
+  nextRun: () => Date | null;
+}
+
+/**
+ * Start the worker. In --once mode it runs each configured job once and resolves;
+ * otherwise it schedules every job and returns a handle (the caller keeps the
+ * process alive and wires signals). The returned promise resolving does NOT mean
+ * the worker stopped.
+ */
+export async function startWorker(
+  config: Config,
+  secrets: Secrets,
+  opts: WorkerOptions = {},
+): Promise<WorkerHandle> {
+  const log = opts.log ?? ((m: string) => process.stderr.write(m + '\n'));
+  const telemetry = opts.telemetry ?? noopTracker;
+  // The live config + derived webhook. Both are `let`: a hot reload (opts.watch)
+  // swaps `current` and recomputes `webhookUrl` so subsequent runs use the new
+  // settings without a restart. Without a watch they never change (old behavior).
+  let current = config;
+  let webhookUrl = resolveWebhookUrl(current, secrets);
+
+  // A scheduled worker that posts needs somewhere to post. Fail fast and loud
+  // rather than silently running into the void. (--dry-run is exempt.)
+  if (!opts.dryRun && !webhookUrl && !opts.runJob) {
+    throw new Error(
+      'inky serve: no Discord webhook configured. Set DISCORD_WEBHOOK_URL (or discord.webhookUrl in config), or pass --dry-run to print instead.',
+    );
+  }
+
+  const runJob =
+    opts.runJob ??
+    (async (job: ScheduleJob) => {
+      const tag = job.label ? ` (${job.label})` : '';
+      log(`inky: running scheduled standup${tag}…`);
+      const built = await buildStandup(current, secrets, { windowHours: job.windowHours, log });
+      // Snapshot the (reloadable) webhook for this run so the dry-run guard below
+      // narrows it to a definite string for postStandupToDiscord.
+      const url = webhookUrl;
+      const dryRun = opts.dryRun || !url;
+      // Anonymous: a scheduled run happened, its window, dry-run, coarse flags.
+      void telemetry.track('standup_run', {
+        trigger: 'scheduled',
+        windowHours: job.windowHours ?? current.windowHours,
+        dryRun,
+        ...configFeatureFlags(current),
+      });
+      if (!url || opts.dryRun) {
+        log(`inky: dry run${tag} — printing standup instead of posting.`);
+        process.stdout.write(built.markdown + '\n');
+        return;
+      }
+      const { messages, embeds } = await postStandupToDiscord(url, built.markdown);
+      log(`inky: posted ${embeds} embed(s) in ${messages} message(s)${tag}.`);
+    });
+
+  if (opts.once) {
+    // Run each configured job once (handy to preview daily + weekly together).
+    // A single cycle never reschedules, so config watching doesn't apply here.
+    for (const job of current.schedule.jobs) {
+      try {
+        await runJob(job);
+      } catch (err) {
+        log(`inky: run failed: ${(err as Error).message}`);
+      }
+    }
+    return { stop: () => {}, nextRun: () => null };
+  }
+
+  const scheduler = opts.scheduler ?? cronScheduler;
+
+  // (Re)build the standup cron jobs from the *current* schedule, stopping any
+  // previous ones first. Called once at boot, and again whenever a reload changes
+  // the schedule. `cronJobs` is reassigned so each tick reads the live array.
+  let cronJobs: ScheduledJob[] = [];
+  const scheduleStandupJobs = () => {
+    cronJobs.forEach((j) => j.stop());
+    const tz = current.schedule.timezone;
+    cronJobs = current.schedule.jobs.map((job, i) => {
+      // One scheduled tick: never throws — a bad run is logged, the worker lives on.
+      const tick = async () => {
+        try {
+          await runJob(job);
+        } catch (err) {
+          const tag = job.label ? ` (${job.label})` : '';
+          log(`inky: scheduled run${tag} failed: ${(err as Error).message}`);
+        } finally {
+          const next = cronJobs[i]?.nextRun() ?? null;
+          if (next) log(`inky: next ${job.label ?? 'run'} ${next.toISOString()}.`);
+        }
+      };
+      const cj = scheduler(job.cron, { timezone: tz }, tick);
+      const next = cj.nextRun();
+      log(
+        `inky: scheduled ${job.label ?? 'standup'} "${job.cron}" (${tz}) — ` +
+          `next run ${next ? next.toISOString() : 'n/a'}.`,
+      );
+      return cj;
+    });
+  };
+
+  // Opt-in liveness: ping once at boot, then daily. Only when telemetry is
+  // active — so a non-telemetry worker schedules nothing extra (and the unit
+  // tests that count scheduled jobs are unaffected).
+  let heartbeat: ScheduledJob | undefined;
+  const startHeartbeat = () => {
+    if (!telemetry.active) return;
+    heartbeat?.stop();
+    heartbeat = scheduler(
+      HEARTBEAT_CRON,
+      { timezone: current.schedule.timezone },
+      () => void telemetry.track('heartbeat'),
+    );
+  };
+  if (telemetry.active) void telemetry.track('heartbeat');
+  startHeartbeat();
+  scheduleStandupJobs();
+
+  // Hot reload: swap the live config and, when the schedule changed, rebuild the
+  // cron jobs (and the heartbeat, which depends on the timezone). A reload error
+  // or a no-op-schedule change never tears anything down — the worker keeps going.
+  const applyReload = (next: Config) => {
+    const scheduleChanged = JSON.stringify(next.schedule) !== JSON.stringify(current.schedule);
+    current = next;
+    webhookUrl = resolveWebhookUrl(current, secrets);
+    if (!opts.dryRun && !webhookUrl && !opts.runJob) {
+      log('inky: reloaded config has no Discord webhook — scheduled posts are skipped until one is set.');
+    }
+    if (scheduleChanged) {
+      log('inky: config changed — rescheduling.');
+      scheduleStandupJobs();
+      startHeartbeat();
+    } else {
+      log('inky: config reloaded (schedule unchanged).');
+    }
+  };
+
+  let stopWatch: (() => void) | undefined;
+  if (opts.watch) {
+    stopWatch = opts.watch(
+      (next) => {
+        try {
+          applyReload(next);
+        } catch (err) {
+          log(`inky: failed to apply reloaded config (keeping previous): ${(err as Error).message}`);
+        }
+      },
+      (err) => log(`inky: config reload error (keeping previous): ${err.message}`),
+    );
+  }
+
+  return {
+    stop: () => {
+      cronJobs.forEach((j) => j.stop());
+      heartbeat?.stop();
+      stopWatch?.();
+    },
+    // The soonest next *standup* run (the heartbeat is internal liveness, not a post).
+    nextRun: () => {
+      const times = cronJobs.map((j) => j.nextRun()).filter((d): d is Date => d != null);
+      return times.length ? times.reduce((a, b) => (a < b ? a : b)) : null;
+    },
+  };
+}
