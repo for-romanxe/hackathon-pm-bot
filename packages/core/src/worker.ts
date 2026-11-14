@@ -19,6 +19,8 @@ import { resolveWebhookUrl } from './config.js';
 import type { ConfigWatch } from './config-source.js';
 import { buildStandup } from './standup.js';
 import { postStandupToDiscord } from './discord.js';
+import { createConflictCheck } from './conflicts.js';
+import { createPrReviewer } from './pr-review.js';
 import { configFeatureFlags, noopTracker, type Tracker } from './telemetry.js';
 
 /** Daily anonymous liveness ping — distinguishes a live deployment from a
@@ -142,6 +144,45 @@ export async function startWorker(
   }
 
   const scheduler = opts.scheduler ?? cronScheduler;
+  const checkConflicts = createConflictCheck(secrets);
+  const reviewPulls = createPrReviewer(secrets, undefined, undefined, opts.dryRun ? undefined : '.inky/pr-auto-reviewed.json');
+  let reviewJob: ScheduledJob | undefined;
+  const scheduleReviews = () => {
+    reviewJob?.stop();
+    const pattern = current.schedule.prReviewCron;
+    if (!pattern) return;
+    reviewJob = scheduler(pattern, { timezone: current.schedule.timezone }, async () => {
+      const url = webhookUrl;
+      if (!url && !opts.dryRun) return;
+      try {
+        await reviewPulls(current, async (message) => {
+          if (!url || opts.dryRun) log(message);
+          else await postStandupToDiscord(url, message);
+        }, log);
+      } catch {
+        log('inky: 자동 PR 리뷰를 완료하지 못했습니다. 다음 주기에 다시 확인합니다.');
+      }
+    });
+  };
+  let conflictJob: ScheduledJob | undefined;
+  const scheduleConflicts = () => {
+    conflictJob?.stop();
+    const pattern = current.schedule.conflictCron;
+    if (!pattern) return;
+    conflictJob = scheduler(pattern, { timezone: current.schedule.timezone }, async () => {
+      const url = webhookUrl;
+      if (!url && !opts.dryRun) return;
+      try {
+        await checkConflicts(current, async (message) => {
+          if (!url || opts.dryRun) log(message);
+          else await postStandupToDiscord(url, message);
+        });
+      } catch (err) {
+        log(`inky: PR conflict check failed: ${(err as Error).message}`);
+      }
+    });
+    log(`inky: scheduled PR conflict check "${pattern}" (${current.schedule.timezone}).`);
+  };
 
   // (Re)build the standup cron jobs from the *current* schedule, stopping any
   // previous ones first. Called once at boot, and again whenever a reload changes
@@ -189,6 +230,8 @@ export async function startWorker(
   if (telemetry.active) void telemetry.track('heartbeat');
   startHeartbeat();
   scheduleStandupJobs();
+  scheduleConflicts();
+  scheduleReviews();
 
   // Hot reload: swap the live config and, when the schedule changed, rebuild the
   // cron jobs (and the heartbeat, which depends on the timezone). A reload error
@@ -203,6 +246,8 @@ export async function startWorker(
     if (scheduleChanged) {
       log('inky: config changed — rescheduling.');
       scheduleStandupJobs();
+      scheduleConflicts();
+      scheduleReviews();
       startHeartbeat();
     } else {
       log('inky: config reloaded (schedule unchanged).');
@@ -227,6 +272,8 @@ export async function startWorker(
     stop: () => {
       cronJobs.forEach((j) => j.stop());
       heartbeat?.stop();
+      conflictJob?.stop();
+      reviewJob?.stop();
       stopWatch?.();
     },
     // The soonest next *standup* run (the heartbeat is internal liveness, not a post).

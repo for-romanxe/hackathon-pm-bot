@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inky · 팀 개발 현황</title>
+  <link rel="stylesheet" href="/live.css">
+  <script defer src="/live.js"></script>
+</head>
+<body>
+  <header class="top"><strong>Inky</strong><span>GitHub 프로젝트</span><span id="connection" role="status">GitHub 연결 대기 중</span></header>
+  <aside aria-label="대시보드 메뉴">
+    <nav>
+      <a href="#overview" aria-current="page">대시보드 개요</a>
+      <a href="#prs">PR 현황</a>
+      <a href="#timeline">활동 타임라인</a>
+      <a href="#team">팀원별 기여도</a>
+    </nav>
+  </aside>
+  <main id="overview">
+    <div class="hero">
+      <div><p class="label">프로젝트 현황</p><h1>팀 개발 현황</h1></div>
+      <p class="meta" id="updated">마지막 동기화 —</p>
+    </div>
+    <dl class="metrics" aria-label="팀 활동 요약">
+      <div><dt>열린 PR</dt><dd id="open-count">0</dd></div>
+      <div><dt>머지 완료</dt><dd id="merge-count">0</dd></div>
+      <div><dt>누적 커밋</dt><dd id="commit-count">0</dd></div>
+      <div><dt>머지 충돌</dt><dd id="conflict-count">0</dd></div>
+    </dl>
+    <section id="prs" class="panel">
+      <h2>PR 현황</h2>
+      <div class="merge-progress">
+        <div class="merge-progress-summary">
+          <span>PR 머지 진행률</span>
+          <strong id="merge-percent">0% 완료</strong>
+        </div>
+        <progress id="merge-progress" max="100" value="0" aria-label="전체 PR 대비 머지 진행률"></progress>
+        <p class="meta" id="merge-progress-count">0 / 0개 머지</p>
+      </div>
+      <ul id="pulls" class="rows"><li class="empty">등록된 PR이 없어요.</li></ul>
+    </section>
+    <div class="columns">
+      <section id="timeline" class="panel">
+        <div class="section-head">
+          <h2>활동 타임라인</h2>
+          <div id="filters" class="filters" aria-label="활동 유형">
+            <button type="button" data-kind="all" aria-pressed="true">전체</button>
+            <button type="button" data-kind="commit" aria-pressed="false">커밋</button>
+            <button type="button" data-kind="pr" aria-pressed="false">PR</button>
+            <button type="button" data-kind="conflict" aria-pressed="false">충돌</button>
+          </div>
+        </div>
+        <ul id="activity" class="rows"><li class="empty">아직 기록된 활동이 없어요.</li></ul>
+        <button type="button" id="more" hidden>이전 활동 더 보기</button>
+      </section>
+      <section id="team" class="panel">
+        <h2>팀원별 기여도</h2>
+        <ul id="people" class="rows"></ul>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

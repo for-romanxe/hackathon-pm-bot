@@ -102,6 +102,8 @@ export const ConfigSchema = z.object({
     .object({
       webhookUrl: z.string().url().optional(),
       channelId: z.string().optional(),
+      /** When set, an unqualified /standup reports from this timestamp. */
+      standupStartAt: z.string().datetime().optional(),
       /** Discord application (client) ID — needed to register the slash command. */
       applicationId: z.string().optional(),
       /**
@@ -126,6 +128,8 @@ export const ConfigSchema = z.object({
   schedule: z
     .object({
       timezone: z.string().default('UTC'),
+      conflictCron: z.string().optional(),
+      prReviewCron: z.string().optional(),
       jobs: z.array(ScheduleJobSchema).default([{ cron: '0 9 * * *', label: 'standup' }]),
     })
     .default({}),

@@ -32,6 +32,8 @@ export type StandupFormat = 'prose' | 'bullets';
 export interface BuildStandupOptions {
   /** Override the window length (hours); defaults to config.windowHours. */
   windowHours?: number;
+  /** Optional report heading. */
+  title?: string;
   /** Skip the AI summary and use the deterministic renderer. */
   mechanical?: boolean;
   /** Per-person style; defaults to config.format. */
@@ -197,13 +199,13 @@ export async function buildStandup(
       });
       log(`standup: summarized with ${llm.provider} (${llm.model}).`);
       return {
-        markdown: renderStandup(standup, { showStats, statsPerPerson: showPerPerson, prevStats }),
+        markdown: renderStandup(standup, { title: opts.title, showStats, statsPerPerson: showPerPerson, prevStats }),
         via: { provider: llm.provider, model: llm.model },
         ...meta,
       };
     } catch (err) {
       log(`standup: AI summary failed (${(err as Error).message}); falling back to mechanical.`);
-      return { markdown: renderMechanical(activity), via: 'mechanical', ...meta };
+      return { markdown: renderMechanical(activity, { title: opts.title }), via: 'mechanical', ...meta };
     }
   }
 
@@ -212,5 +214,5 @@ export async function buildStandup(
       `standup: no ${PROVIDER_ENV[config.provider]} set for provider '${config.provider}' — using mechanical render.`,
     );
   }
-  return { markdown: renderMechanical(activity), via: 'mechanical', ...meta };
+  return { markdown: renderMechanical(activity, { title: opts.title }), via: 'mechanical', ...meta };
 }

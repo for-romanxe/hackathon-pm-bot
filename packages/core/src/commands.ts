@@ -14,9 +14,79 @@ import { buildStandup as buildStandupImpl } from './standup.js';
 import { buildAnswer as buildAnswerImpl } from './ask.js';
 import { standupEmbeds as standupEmbedsImpl, type StandupEmbed } from './discord.js';
 import { configFeatureFlags, noopTracker, type Tracker } from './telemetry.js';
+import { resolveOctokit } from './github-auth.js';
+import { reviewPrByNumber } from './pr-review.js';
 
 export const STANDUP_COMMAND_NAME = 'standup';
 export const ASK_COMMAND_NAME = 'ask';
+export const OPENPR_COMMAND_NAME = 'openpr';
+export const DASH_COMMAND_NAME = 'dash';
+export const PR_COMMAND_NAME = 'pr';
+// Four existing guild commands plus /pr leave 95 chat-input names.
+const MAX_NUMBERED_PR_COMMAND = 95;
+
+export function numberedPrCommand(command: string): number | null {
+  const match = /^pr([1-9][0-9]?)$/.exec(command);
+  const number = Number(match?.[1]);
+  return number <= MAX_NUMBERED_PR_COMMAND ? number : null;
+}
+
+export async function handlePrCommand(
+  ix: StandupInteraction, config: Config, secrets: Secrets, aliasNumber: number | null = null, review = reviewPrByNumber,
+): Promise<void> {
+  await ix.defer(false);
+  const number = aliasNumber ?? ix.getInteger('번호');
+  const repo = ix.getString('저장소') ?? (config.repos.length === 1 ? config.repos[0] : undefined);
+  if (number === null || !Number.isSafeInteger(number) || number < 1) {
+    await ix.respondError('PR 번호를 입력해 주세요. 예: /pr 번호:13');
+    return;
+  }
+  if (!repo || !config.repos.includes(repo)) {
+    await ix.respondError('이 봇에 연결된 저장소 이름을 저장소 옵션에 입력해 주세요.');
+    return;
+  }
+  try {
+    await ix.respond(standupEmbedsImpl(await review(config, secrets, number, repo)));
+  } catch {
+    await ix.respondError(`#${number} PR 리뷰에 실패했어요. 잠시 후 다시 시도해 주세요.`);
+  }
+}
+
+export async function handleOpenPrCommand(
+  ix: StandupInteraction,
+  config: Config,
+  secrets: Secrets,
+  getClient = resolveOctokit,
+): Promise<void> {
+  await ix.defer(false);
+  if (config.discord.standupStartAt && Date.now() < Date.parse(config.discord.standupStartAt)) {
+    await ix.respond(standupEmbedsImpl('대회 시작 후 열린 PR을 확인할 수 있어요.'));
+    return;
+  }
+
+  try {
+    if (!config.repos.length) throw new Error('No repositories configured');
+    const github = await getClient(config, secrets);
+    const rows: { number: number; text: string }[] = [];
+    for (const repo of config.repos) {
+      const target = { owner: config.org, repo };
+      const open = await github.paginate(github.rest.pulls.list, { ...target, state: 'open', per_page: 100 });
+      for (const pull of open) {
+        const { data } = await github.rest.pulls.get({ ...target, pull_number: pull.number });
+        if (data.state !== 'open') continue;
+        const status = data.mergeable === false ? '충돌'
+          : data.draft ? '초안'
+          : data.mergeable === null ? '확인 중' : '열림';
+        rows.push({ number: data.number, text: `- [#${data.number}](${data.html_url}) · ${status}` });
+      }
+    }
+    rows.sort((a, b) => b.number - a.number);
+    const report = rows.length ? `열린 PR ${rows.length}개\n${rows.map((row) => row.text).join('\n')}` : '현재 열린 PR이 없어요.';
+    await ix.respond(standupEmbedsImpl(report));
+  } catch {
+    await ix.respondError('GitHub에서 열린 PR을 확인하지 못했어요. 잠시 후 다시 시도해 주세요.');
+  }
+}
 
 /** Preset ranges the picker offers → window length in hours. */
 const RANGE_HOURS: Record<string, number> = {
@@ -75,15 +145,10 @@ export function buildStandupCommand(): SlashCommandBuilder {
       .setDescription('Per-person style (default: bullets)')
       .addChoices({ name: 'Bullets', value: 'bullets' }, { name: 'Prose', value: 'prose' }),
   );
-  // Private (ephemeral) reply — only the invoker sees it. Lets a manager inspect
-  // the team's activity without posting it to the channel.
-  cmd.addBooleanOption((o) =>
-    o.setName('private').setDescription('Only you see the reply — inspect the team privately'),
-  );
   return cmd;
 }
 
-/** The `/ask` command: a free-text question + the same window/private controls. */
+/** The `/ask` command: a free-text question + the same window controls. */
 export function buildAskCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
     .setName(ASK_COMMAND_NAME)
@@ -112,9 +177,6 @@ export function buildAskCommand(): SlashCommandBuilder {
       .setDescription(`Custom window in days (overrides range), ${MIN_DAYS}–${MAX_DAYS}`)
       .setMinValue(MIN_DAYS)
       .setMaxValue(MAX_DAYS),
-  );
-  cmd.addBooleanOption((o) =>
-    o.setName('private').setDescription('Only you see the reply — ask privately'),
   );
   return cmd;
 }
@@ -219,23 +281,36 @@ export async function handleStandupCommand(
   const build = deps.buildStandup ?? buildStandupImpl;
   const toEmbeds = deps.standupEmbeds ?? standupEmbedsImpl;
   const req = resolveStandupRequest(ix);
-  const ephemeral = ix.getBoolean('private') ?? false;
+  const startAt = req.windowHours === undefined ? config.discord.standupStartAt : undefined;
+  const requestedAt = new Date();
 
-  await ix.defer(ephemeral); // building takes ~seconds; Discord wants an ack within 3
+  await ix.defer(false); // building takes ~seconds; Discord wants an ack within 3
   try {
-    const built = await build(config, secrets, { ...req, log });
-    // Anonymous: a /standup command ran, its window + coarse flags. `private`
-    // is a UI choice, not identity, so it's safe to count.
+    const elapsedHours = startAt ? (requestedAt.getTime() - Date.parse(startAt)) / 3_600_000 : undefined;
+    if (elapsedHours !== undefined && elapsedHours <= 0) {
+      await ix.respond(toEmbeds('대회 시작 후 누적 진행 상황을 확인할 수 있어요.'));
+      return;
+    }
+    const built = await build(config, secrets, {
+      ...req,
+      ...(elapsedHours !== undefined && {
+        now: requestedAt,
+        windowHours: elapsedHours,
+        title: '📋 대회 누적 진행 상황',
+      }),
+      log,
+    });
+    // Anonymous: a /standup command ran, its window + coarse flags.
     void telemetry.track('standup_run', {
       trigger: 'command',
-      windowHours: req.windowHours ?? config.windowHours,
+      windowHours: elapsedHours ?? req.windowHours ?? config.windowHours,
       dryRun: false,
-      private: ephemeral,
+      private: false,
       ...configFeatureFlags(config),
     });
     await ix.respond(toEmbeds(built.markdown));
     log(
-      `inky: /standup answered for ${ix.user} (${describeWindow(req.windowHours)}${ephemeral ? ', private' : ''}).`,
+      `inky: /standup answered for ${ix.user} (${startAt ? 'since contest start' : describeWindow(req.windowHours)}).`,
     );
   } catch (err) {
     const message = (err as Error).message ?? String(err);
@@ -277,9 +352,8 @@ export async function handleAskCommand(
 
   const question = (ix.getString('question') ?? '').trim();
   const windowHours = resolveCommandWindow(ix.getString('range'), ix.getInteger('days'));
-  const ephemeral = ix.getBoolean('private') ?? false;
 
-  await ix.defer(ephemeral);
+  await ix.defer(false);
   try {
     if (!question) {
       // Discord enforces the required option, but the handler is tested directly —
@@ -289,17 +363,17 @@ export async function handleAskCommand(
       return;
     }
     const built = await build(config, secrets, { question, windowHours, log });
-    // Anonymous: a question was asked, its window, whether it was answerable, and
-    // whether it was private. NEVER the question text or any content.
+    // Anonymous: a question was asked, its window, and whether it was answerable.
+    // NEVER the question text or any content.
     void telemetry.track('ask_run', {
       trigger: 'command',
       windowHours: windowHours ?? config.windowHours,
       grounded: built.grounded,
-      private: ephemeral,
+      private: false,
     });
     await ix.respond(toEmbeds(built.markdown));
     log(
-      `inky: /ask answered for ${ix.user} (${describeWindow(windowHours)}${built.grounded ? '' : ', not answerable from the window'}${ephemeral ? ', private' : ''}).`,
+      `inky: /ask answered for ${ix.user} (${describeWindow(windowHours)}${built.grounded ? '' : ', not answerable from the window'}).`,
     );
   } catch (err) {
     const message = (err as Error).message ?? String(err);
@@ -318,15 +392,27 @@ export interface RegisterOptions {
   /** Register to one guild (instant) when set; otherwise globally (~1h to appear). */
   guildId?: string;
   token: string;
+  dashboardLink?: boolean;
   log?: (msg: string) => void;
   /** Injectable transport for tests; defaults to discord.js REST.put. */
   put?: (route: string, body: unknown) => Promise<void>;
 }
 
-/** Register (PUT) the `/standup` and `/ask` commands with Discord — guild-scoped or global. */
+/** Register the slash commands with Discord, guild-scoped or global. */
 export async function registerCommands(opts: RegisterOptions): Promise<void> {
   const log = opts.log ?? (() => {});
-  const body = [buildStandupCommand().toJSON(), buildAskCommand().toJSON()];
+  const openPr = new SlashCommandBuilder().setName(OPENPR_COMMAND_NAME).setDescription('열린 PR 번호와 상태를 확인합니다');
+  const pr = new SlashCommandBuilder().setName(PR_COMMAND_NAME).setDescription('PR 번호로 Codex 리뷰를 요청합니다')
+    .addIntegerOption((option) => option.setName('번호').setDescription('리뷰할 PR 번호').setMinValue(1).setRequired(true))
+    .addStringOption((option) => option.setName('저장소').setDescription('여러 저장소가 연결된 경우 저장소 이름'));
+  const body = [buildStandupCommand().toJSON(), buildAskCommand().toJSON(), openPr.toJSON(), pr.toJSON()];
+  if (opts.dashboardLink && opts.guildId) {
+    body.push(new SlashCommandBuilder().setName(DASH_COMMAND_NAME)
+      .setDescription('팀 대시보드 링크를 보여줍니다').toJSON());
+    for (let number = 1; number <= MAX_NUMBERED_PR_COMMAND; number++) {
+      body.push(new SlashCommandBuilder().setName(`pr${number}`).setDescription(`#${number} PR을 Codex로 리뷰합니다`).toJSON());
+    }
+  }
   const put =
     opts.put ??
     (async (route: string, payload: unknown) => {
@@ -338,9 +424,7 @@ export async function registerCommands(opts: RegisterOptions): Promise<void> {
     ? Routes.applicationGuildCommands(opts.applicationId, opts.guildId)
     : Routes.applicationCommands(opts.applicationId);
   await put(route, body);
-  log(
-    opts.guildId
-      ? `inky: registered /${STANDUP_COMMAND_NAME} + /${ASK_COMMAND_NAME} to guild ${opts.guildId} (instant).`
-      : `inky: registered /${STANDUP_COMMAND_NAME} + /${ASK_COMMAND_NAME} globally (can take up to ~1h to appear).`,
-  );
+  const names = body.filter(({ name }) => numberedPrCommand(name) === null).map(({ name }) => `/${name}`).join(', ')
+    + (opts.dashboardLink && opts.guildId ? `, /pr1–/pr${MAX_NUMBERED_PR_COMMAND}` : '');
+  log(`inky: registered ${names} ${opts.guildId ? `to guild ${opts.guildId}` : 'globally'}.`);
 }

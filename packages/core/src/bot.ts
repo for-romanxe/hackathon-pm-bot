@@ -20,8 +20,14 @@ import {
 import type { Config, Secrets } from './config.js';
 import {
   ASK_COMMAND_NAME,
+  DASH_COMMAND_NAME,
   handleAskCommand,
+  handleOpenPrCommand,
+  handlePrCommand,
   handleStandupCommand,
+  OPENPR_COMMAND_NAME,
+  PR_COMMAND_NAME,
+  numberedPrCommand,
   STANDUP_COMMAND_NAME,
   type StandupInteraction,
 } from './commands.js';
@@ -30,6 +36,7 @@ import { noopTracker, type Tracker } from './telemetry.js';
 
 export interface BotOptions {
   log?: (msg: string) => void;
+  dashboardUrl?: string;
   /** Anonymous usage telemetry (opt-in). Defaults to the inert noop tracker. */
   telemetry?: Tracker;
 }
@@ -51,20 +58,56 @@ export async function startBot(
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+  let reviewingPr = false;
+
   client.once(Events.ClientReady, (c) => {
-    log(`inky: bot online as ${c.user.tag}. /${STANDUP_COMMAND_NAME} + /${ASK_COMMAND_NAME} are ready.`);
+    log(`inky: bot online as ${c.user.tag}. /standup, /ask, /openpr and /pr are ready.`);
   });
 
   client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (!interaction.isChatInputCommand()) return;
     const command = interaction.commandName;
-    if (command !== STANDUP_COMMAND_NAME && command !== ASK_COMMAND_NAME) return;
+    const aliasNumber = numberedPrCommand(command);
+    const prReview = command === PR_COMMAND_NAME || aliasNumber !== null;
+    const dashboard = command === DASH_COMMAND_NAME && Boolean(config.discord.guildId && config.discord.channelId);
+    if (!dashboard && command !== STANDUP_COMMAND_NAME && command !== ASK_COMMAND_NAME && command !== OPENPR_COMMAND_NAME && !prReview) return;
     // This listener is fire-and-forget: an unhandled rejection here would crash
     // the process (Node's default), so contain everything.
     try {
+      const { guildId, channelId } = config.discord;
+      if ((guildId && interaction.guildId !== guildId) ||
+          (channelId && interaction.channelId !== channelId)) {
+        await interaction.reply({ content: '이 명령은 지정된 팀 알림 채널에서 사용할 수 있어요.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (dashboard) {
+        await interaction.reply({
+          content: opts.dashboardUrl
+            ? `[팀 대시보드 열기](<${opts.dashboardUrl}>)`
+            : '아직 대시보드 링크가 준비되지 않았어요.',
+        });
+        return;
+      }
       const ix = adapt(interaction, log);
       if (command === ASK_COMMAND_NAME) {
         await handleAskCommand(ix, config, secrets, { log, telemetry });
+      } else if (command === OPENPR_COMMAND_NAME) {
+        await handleOpenPrCommand(ix, config, secrets);
+      } else if (prReview) {
+        if (!guildId || !channelId) {
+          await interaction.reply({ content: 'PR 리뷰는 설정된 팀 알림 채널에서 사용할 수 있어요.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (reviewingPr) {
+          await interaction.reply({ content: '다른 PR 리뷰가 진행 중이에요. 잠시 후 다시 요청해 주세요.' });
+          return;
+        }
+        reviewingPr = true;
+        try {
+          await handlePrCommand(ix, config, secrets, aliasNumber);
+        } finally {
+          reviewingPr = false;
+        }
       } else {
         await handleStandupCommand(ix, config, secrets, { log, telemetry });
       }

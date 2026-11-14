@@ -66,8 +66,8 @@ Scheduled posts follow `DISCORD_WEBHOOK_URL`, and **a webhook is bound to one ch
 
 ## Use `/standup`
 Type `/standup` in any channel. Options: `range` / `days`, `stats`, `per_person`,
-`format` — each overrides the config default for that run. Add `private:true` for an
-**ephemeral** reply only you can see (inspect the team without posting publicly). It's
+`format` — each overrides the config default for that run. Replies are visible in
+the channel. The command is
 **admin-only by default**; broaden it in Server Settings → Integrations.
 
 ## Rotate a token

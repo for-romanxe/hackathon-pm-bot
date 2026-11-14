@@ -10,6 +10,12 @@
 
 # Inky 🐙
 
+**해커톤 팀 운영판** · [한국어 설치 및 사용법](docs/TEAM-SETUP.ko.md)
+
+원본: [augmentation-co/inky](https://github.com/augmentation-co/inky) · 기준 커밋 `553cab2` · [MIT 라이선스](LICENSE).
+
+아래 영어 문서는 원본 Inky에 대한 설명입니다. 이 저장소의 추가 기능과 설정은 위 사용법을 참고하세요.
+
 > Your team's daily standup, written for you.
 
 Inky is a Discord bot that reads an organization's GitHub activity each day and
@@ -277,14 +283,12 @@ defaults per run:
 
 ```
 /standup range:This week stats:On per_person:false format:prose
-/standup range:This week private:true        # only you see it
 ```
 
 `range` (Today / This week / This month) or a custom `days` (1–90); `stats`
 (On / Off / Auto), `per_person`, and `format` (Bullets / Prose) — all optional,
-each falling back to `inky.config.json`. Add **`private:true`** to get the reply
-**ephemerally** — visible only to you, so a manager can inspect the team's
-activity without posting it to the channel. Enable it by setting `DISCORD_BOT_TOKEN`
+each falling back to `inky.config.json`. Replies are visible in the channel.
+Enable it by setting `DISCORD_BOT_TOKEN`
 + `discord.applicationId`, running `inky register-commands` once, then
 `inky serve`. Full walkthrough: [`docs/discord-bot-setup.md`](docs/discord-bot-setup.md).
 
@@ -295,7 +299,6 @@ activity, instead of the full standup:
 
 ```
 /ask question:what did the team ship this week? range:This week
-/ask question:what's still in flight on the api? private:true   # only you see it
 ```
 
 Inky answers **only from the window's verified activity** (the same factual digest

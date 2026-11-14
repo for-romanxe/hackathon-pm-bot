@@ -1,0 +1,19 @@
+{
+  "org": "GITHUB_OWNER",
+  "repos": ["TEST_REPO"],
+  "windowHours": 1,
+  "stats": "on",
+  "statsPerPerson": true,
+  "discord": {
+    "applicationId": "DISCORD_APPLICATION_ID",
+    "guildId": "DISCORD_SERVER_ID",
+    "channelId": "DISCORD_CHANNEL_ID"
+  },
+  "schedule": {
+    "timezone": "Asia/Seoul",
+    "conflictCron": "*/2 * * * *",
+    "prReviewCron": "*/2 * * * *",
+    "jobs": [{ "cron": "0 * * * *", "windowHours": 1, "label": "hourly" }]
+  },
+  "telemetry": { "enabled": false }
+}

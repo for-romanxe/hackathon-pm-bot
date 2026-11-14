@@ -375,7 +375,7 @@ async function main(): Promise<void> {
       // On-demand /standup — runs when a bot token is configured.
       if (secrets.discordBotToken) {
         const { startBot } = await import('./bot.js');
-        const bot = await startBot(config, secrets, { log: (m) => console.error(m), telemetry });
+        const bot = await startBot(config, secrets, { log: (m) => console.error(m), telemetry, dashboardUrl: process.env.DASHBOARD_JOIN_URL });
         stops.push(bot.stop);
       }
 
@@ -409,6 +409,7 @@ async function main(): Promise<void> {
       await registerCommands({
         applicationId,
         guildId: config.discord.guildId,
+        dashboardLink: Boolean(config.discord.channelId),
         token,
         log: (m) => console.error(m),
       });

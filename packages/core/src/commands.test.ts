@@ -5,6 +5,9 @@ import {
   buildStandupCommand,
   describeWindow,
   handleAskCommand,
+  handleOpenPrCommand,
+  handlePrCommand,
+  numberedPrCommand,
   handleStandupCommand,
   registerCommands,
   resolveCommandWindow,
@@ -130,7 +133,7 @@ test('handleStandupCommand defers, builds with the requested options, and respon
   assert.equal(state.ephemeral, false); // public by default
 });
 
-test('handleStandupCommand defers ephemerally when private:true (manager inspects privately)', async () => {
+test('handleStandupCommand stays public if Discord sends the old private option', async () => {
   const { ix, state } = makeIx({ range: 'week', private: true });
   await handleStandupCommand(ix, cfg(), secrets, {
     buildStandup: fakeBuild({}),
@@ -138,7 +141,7 @@ test('handleStandupCommand defers ephemerally when private:true (manager inspect
     log: () => {},
   });
   assert.deepEqual(state.calls, ['defer', 'respond']);
-  assert.equal(state.ephemeral, true);
+  assert.equal(state.ephemeral, false);
 });
 
 test('handleStandupCommand reports a build failure in place of the standup', async () => {
@@ -209,7 +212,7 @@ test('handleAskCommand defers, answers the question for the window, and responds
   assert.deepEqual(events[0]!.props, { trigger: 'command', windowHours: 168, grounded: true, private: false });
 });
 
-test('handleAskCommand answers privately (ephemeral) when private:true', async () => {
+test('handleAskCommand stays public if Discord sends the old private option', async () => {
   const { ix, state } = makeIx({ question: 'what shipped?', private: true });
   const { tracker, events } = recordingTracker();
   await handleAskCommand(ix, cfg(), secrets, {
@@ -218,8 +221,8 @@ test('handleAskCommand answers privately (ephemeral) when private:true', async (
     telemetry: tracker,
     log: () => {},
   });
-  assert.equal(state.ephemeral, true);
-  assert.equal(events[0]!.props?.private, true);
+  assert.equal(state.ephemeral, false);
+  assert.equal(events[0]!.props?.private, false);
 });
 
 test('handleAskCommand carries grounded=false into telemetry when unanswerable', async () => {
@@ -261,17 +264,22 @@ test('handleAskCommand reports a build failure in place of the answer', async ()
   assert.match(state.error ?? '', /no ANTHROPIC_API_KEY/);
 });
 
-test('registerCommands registers both /standup and /ask', async () => {
+test('registerCommands preserves existing commands and registers /pr13 as a no-option command', async () => {
   const sent: { route: string; body: unknown } = { route: '', body: undefined };
   await registerCommands({
     applicationId: 'app',
     guildId: 'guild',
+    dashboardLink: true,
     token: 'tok',
     put: async (route, body) => void Object.assign(sent, { route, body }),
     log: () => {},
   });
-  const names = (sent.body as Array<{ name: string }>).map((c) => c.name);
-  assert.deepEqual(names.sort(), ['ask', 'standup']);
+  const commands = sent.body as Array<{ name: string; options?: unknown[] }>;
+  assert.equal(commands.length, 100);
+  assert.deepEqual(commands.filter(({ name }) => numberedPrCommand(name) === null).map(({ name }) => name).sort(),
+    ['ask', 'dash', 'openpr', 'pr', 'standup']);
+  assert.equal(commands.find(({ name }) => name === 'pr13')?.options?.length ?? 0, 0);
+  assert.equal(numberedPrCommand('pr96'), null);
 });
 
 test('handleStandupCommand truncates a long error and survives a failing error reply', async () => {
@@ -332,7 +340,8 @@ test('buildStandupCommand exposes range, days, and the report-setting options', 
 
   assert.ok(byName('per_person')); // boolean toggle
   assert.equal((byName('format')!.choices as unknown[]).length, 2);
-  assert.ok(byName('private')); // ephemeral-reply toggle
+  assert.equal(byName('private'), undefined);
+  assert.ok(!buildAskCommand().toJSON().options?.some((option) => option.name === 'private'));
 });
 
 test('registerCommands targets a guild route when guildId is set', async () => {
@@ -358,4 +367,32 @@ test('registerCommands targets the global route without a guildId', async () => 
     put: async (route) => void calls.push(route),
   });
   assert.match(calls[0]!, /applications\/app1\/commands$/);
+});
+
+test('/pr13 defers publicly and reviews PR #13 from the configured repo', async () => {
+  const { ix, state } = makeIx();
+  await handlePrCommand(ix, ConfigSchema.parse({ org: 'Team', repos: ['demo'] }), secrets, numberedPrCommand('pr13'),
+    async (_config, _secrets, number, repo) => {
+      assert.deepEqual(state.calls, ['defer']);
+      assert.equal(number, 13);
+      assert.equal(repo, 'demo');
+      return 'PR 리뷰 결과';
+    });
+  assert.deepEqual(state.calls, ['defer', 'respond']);
+  assert.equal(state.ephemeral, false);
+  assert.match(state.embeds?.[0]?.description ?? '', /PR 리뷰 결과/);
+});
+
+test('/openpr shows the empty list publicly', async () => {
+  const { ix, state } = makeIx();
+  const config = ConfigSchema.parse({ org: 'Team', repos: ['demo'] });
+  const github = {
+    paginate: async () => [],
+    rest: { pulls: { list: () => {} } },
+  };
+  await handleOpenPrCommand(ix, config, secrets,
+    async () => github as unknown as Awaited<ReturnType<NonNullable<Parameters<typeof handleOpenPrCommand>[3]>>>);
+  assert.deepEqual(state.calls, ['defer', 'respond']);
+  assert.equal(state.ephemeral, false);
+  assert.match(state.embeds?.[0]?.description ?? '', /현재 열린 PR이 없어요/);
 });

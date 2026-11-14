@@ -31,3 +31,9 @@ npm-debug.log*
 
 # telemetry runtime state (the anonymous, per-install id) — never commit
 .inky/
+launch-team.json
+
+# Local keys and dashboard data
+.env.*
+!.env.example
+*.pem
